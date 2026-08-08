@@ -30,7 +30,7 @@ NODATA         = -9999.0
 WATERSHED_REPO = "J2003S/hydrology-data-vault"
 WATERSHED_FILE = "Watershed.fgb"
 
-MAX_RANGE_BYTES          = 8 * 1024 * 1024          # Max 8 MB per request chunk
+MAX_RANGE_BYTES          = 8 * 1024 * 1024          # Max 8 MB per chunk
 DAILY_BYTE_QUOTA_PER_KEY = 500 * 1024 * 1024        # Max 500 MB daily limit
 
 if not HF_TOKEN:
@@ -43,7 +43,7 @@ _ledger_lock: threading.Lock = threading.Lock()
 app = FastAPI(
     title="India TRI Data Gateway",
     description="Authenticated secure router and metered proxy for private raster layers.",
-    version="1.2.1",
+    version="1.2.2",
 )
 
 app.add_middleware(
@@ -110,7 +110,6 @@ def check_api_key(x_api_key: Optional[str]) -> str:
     return x_api_key or "anonymous"
 
 def _check_and_record_quota(api_key: str, requested_bytes: int):
-    """Checks and updates the cumulative daily quota per API key in a thread-safe manner."""
     now = time.time()
     with _ledger_lock:
         record = _usage_ledger.get(api_key)
@@ -127,10 +126,6 @@ def _check_and_record_quota(api_key: str, requested_bytes: int):
         record["bytes"] += requested_bytes
 
 def _parse_and_clamp_range(range_header: str, max_bytes: int) -> Tuple[Optional[str], Optional[int]]:
-    """
-    Parses range requests (e.g. 'bytes=0-', 'bytes=0-16383') and clamps 
-    open-ended or oversized range spans down to max_bytes seamlessly.
-    """
     try:
         unit, _, spec = range_header.partition("=")
         if unit.strip().lower() != "bytes" or "," in spec:
@@ -152,6 +147,19 @@ def _parse_and_clamp_range(range_header: str, max_bytes: int) -> Tuple[Optional[
         return f"bytes={start}-{end}", span
     except Exception:
         return None, None
+
+async def _resolve_s3_cdn_url(filename: str) -> str:
+    """Resolves HF 302 redirect to obtain the raw pre-signed S3 CDN URL."""
+    raw_url = _tile_url(filename)
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.head(
+            raw_url,
+            headers={"Authorization": f"Bearer {HF_TOKEN}"},
+            follow_redirects=False
+        )
+        if resp.status_code in (301, 302, 303, 307) and "location" in resp.headers:
+            return resp.headers["location"]
+        return raw_url
 
 def _resolve_signed_url(repo_id: str, filename: str, repo_type: str = "dataset") -> str:
     raw_url = hf_hub_url(repo_id=repo_id, filename=filename, repo_type=repo_type)
@@ -194,7 +202,7 @@ def resolve_watershed(x_api_key: Optional[str] = Header(None)):
     url = _resolve_signed_url(WATERSHED_REPO, WATERSHED_FILE)
     return {"url": url}
 
-# SECURE METERED TILE PROXY (Supports GET and HEAD)
+# SECURE METERED TILE PROXY
 @app.api_route("/tiles/{filename}", methods=["GET", "HEAD"])
 async def get_tile_bytes(filename: str, request: Request, x_api_key: Optional[str] = Header(None)):
     api_key = check_api_key(x_api_key)
@@ -202,23 +210,20 @@ async def get_tile_bytes(filename: str, request: Request, x_api_key: Optional[st
     if filename not in TRI_TILES:
         raise HTTPException(status_code=404, detail="Unknown tile filename.")
 
-    upstream_url = _tile_url(filename)
+    # 1. Obtain pre-signed S3 CDN URL
+    s3_cdn_url = await _resolve_s3_cdn_url(filename)
 
-    # Handle HEAD requests from GDAL
+    # 2. Handle HEAD requests (do NOT pass Authorization header to S3)
     if request.method == "HEAD":
         async with httpx.AsyncClient(timeout=30.0) as client:
-            upstream_resp = await client.head(
-                upstream_url, 
-                headers={"Authorization": f"Bearer {HF_TOKEN}"}, 
-                follow_redirects=True
-            )
+            upstream_resp = await client.head(s3_cdn_url)
         headers = {"Accept-Ranges": "bytes"}
         for h in ("Content-Length", "Content-Type"):
             if h in upstream_resp.headers:
                 headers[h] = upstream_resp.headers[h]
         return Response(status_code=upstream_resp.status_code, headers=headers)
 
-    # Handle GET range requests
+    # 3. Handle GET range requests
     range_header = request.headers.get("range")
     if not range_header:
         range_header = f"bytes=0-{MAX_RANGE_BYTES - 1}"
@@ -227,19 +232,15 @@ async def get_tile_bytes(filename: str, request: Request, x_api_key: Optional[st
     if not clamped_range or span is None:
         raise HTTPException(status_code=400, detail="Invalid Range header format.")
     
-    # 1. Enforce cumulative daily quota
     _check_and_record_quota(api_key, span)
     
-    # 2. Proxy request upstream to Hugging Face
-    upstream_headers = {"Authorization": f"Bearer {HF_TOKEN}", "Range": clamped_range}
-    
+    # 4. Proxy range request directly to S3 without Authorization header
     async with httpx.AsyncClient(timeout=30.0) as client:
-        upstream_resp = await client.get(upstream_url, headers=upstream_headers, follow_redirects=True)
+        upstream_resp = await client.get(s3_cdn_url, headers={"Range": clamped_range})
         
     if upstream_resp.status_code not in (200, 206):
         raise HTTPException(status_code=502, detail="Error fetching byte range from upstream storage.")
     
-    # 3. Return partial content to the client
     body = upstream_resp.content
     passthrough_headers = {"Accept-Ranges": "bytes"}
     for h in ("Content-Range", "Content-Length"):
