@@ -30,8 +30,8 @@ NODATA         = -9999.0
 WATERSHED_REPO = "J2003S/hydrology-data-vault"
 WATERSHED_FILE = "Watershed.fgb"
 
-MAX_RANGE_BYTES          = 8 * 1024 * 1024          # Max 8 MB per HTTP Range request
-DAILY_BYTE_QUOTA_PER_KEY = 500 * 1024 * 1024        # Max 500 MB daily transfer limit
+MAX_RANGE_BYTES          = 8 * 1024 * 1024          # Max 8 MB per request chunk
+DAILY_BYTE_QUOTA_PER_KEY = 500 * 1024 * 1024        # Max 500 MB daily limit
 
 if not HF_TOKEN:
     raise RuntimeError("HF_TOKEN environment variable is missing on Render.")
@@ -43,13 +43,13 @@ _ledger_lock: threading.Lock = threading.Lock()
 app = FastAPI(
     title="India TRI Data Gateway",
     description="Authenticated secure router and metered proxy for private raster layers.",
-    version="1.2.0",
+    version="1.2.1",
 )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.environ.get("ALLOWED_ORIGINS", "*").split(","),
-    allow_methods=["GET", "OPTIONS"],
+    allow_methods=["GET", "HEAD", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["Content-Range", "Content-Length", "Accept-Ranges"],
 )
@@ -114,7 +114,6 @@ def _check_and_record_quota(api_key: str, requested_bytes: int):
     now = time.time()
     with _ledger_lock:
         record = _usage_ledger.get(api_key)
-        # Reset counter if key doesn't exist or 24h window passed
         if not record or now > record["reset_at"]:
             record = {"bytes": 0, "reset_at": now + 86400}
             _usage_ledger[api_key] = record
@@ -122,13 +121,39 @@ def _check_and_record_quota(api_key: str, requested_bytes: int):
         if record["bytes"] + requested_bytes > DAILY_BYTE_QUOTA_PER_KEY:
             raise HTTPException(
                 status_code=429,
-                detail="Daily data transfer limit (500 MB) exceeded for this API key. Try again tomorrow."
+                detail="Daily data transfer limit (500 MB) exceeded for this API key."
             )
 
         record["bytes"] += requested_bytes
 
+def _parse_and_clamp_range(range_header: str, max_bytes: int) -> Tuple[Optional[str], Optional[int]]:
+    """
+    Parses range requests (e.g. 'bytes=0-', 'bytes=0-16383') and clamps 
+    open-ended or oversized range spans down to max_bytes seamlessly.
+    """
+    try:
+        unit, _, spec = range_header.partition("=")
+        if unit.strip().lower() != "bytes" or "," in spec:
+            return None, None
+        
+        start_str, _, end_str = spec.partition("-")
+        start = int(start_str.strip())
+        
+        if end_str.strip():
+            end = int(end_str.strip())
+            span = end - start + 1
+            if span > max_bytes:
+                end = start + max_bytes - 1
+                span = max_bytes
+        else:
+            end = start + max_bytes - 1
+            span = max_bytes
+            
+        return f"bytes={start}-{end}", span
+    except Exception:
+        return None, None
+
 def _resolve_signed_url(repo_id: str, filename: str, repo_type: str = "dataset") -> str:
-    """Uses server-side HF_TOKEN to securely fetch a pre-signed temporary CDN URL."""
     raw_url = hf_hub_url(repo_id=repo_id, filename=filename, repo_type=repo_type)
     resp = requests.head(
         raw_url,
@@ -163,41 +188,50 @@ def manifest(request: Request, x_api_key: Optional[str] = Header(None)):
         ],
     })
 
-# Vector Resolution Endpoint
 @app.get("/api/v1/resolve/watershed")
 def resolve_watershed(x_api_key: Optional[str] = Header(None)):
     check_api_key(x_api_key)
     url = _resolve_signed_url(WATERSHED_REPO, WATERSHED_FILE)
     return {"url": url}
 
-# SECURE METERED TILE PROXY
-@app.get("/tiles/{filename}")
+# SECURE METERED TILE PROXY (Supports GET and HEAD)
+@app.api_route("/tiles/{filename}", methods=["GET", "HEAD"])
 async def get_tile_bytes(filename: str, request: Request, x_api_key: Optional[str] = Header(None)):
     api_key = check_api_key(x_api_key)
     
     if filename not in TRI_TILES:
         raise HTTPException(status_code=404, detail="Unknown tile filename.")
-        
+
+    upstream_url = _tile_url(filename)
+
+    # Handle HEAD requests from GDAL
+    if request.method == "HEAD":
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            upstream_resp = await client.head(
+                upstream_url, 
+                headers={"Authorization": f"Bearer {HF_TOKEN}"}, 
+                follow_redirects=True
+            )
+        headers = {"Accept-Ranges": "bytes"}
+        for h in ("Content-Length", "Content-Type"):
+            if h in upstream_resp.headers:
+                headers[h] = upstream_resp.headers[h]
+        return Response(status_code=upstream_resp.status_code, headers=headers)
+
+    # Handle GET range requests
     range_header = request.headers.get("range")
     if not range_header:
-        raise HTTPException(
-            status_code=416, 
-            detail="Range header required. Full tile downloads are not permitted."
-        )
-        
-    span = _parse_explicit_range_span(range_header)
-    if span is None or span > MAX_RANGE_BYTES:
-        raise HTTPException(
-            status_code=416, 
-            detail=f"Range span invalid or exceeds maximum allowed single request limit of {MAX_RANGE_BYTES // (1024*1024)} MB."
-        )
+        range_header = f"bytes=0-{MAX_RANGE_BYTES - 1}"
+
+    clamped_range, span = _parse_and_clamp_range(range_header, MAX_RANGE_BYTES)
+    if not clamped_range or span is None:
+        raise HTTPException(status_code=400, detail="Invalid Range header format.")
     
     # 1. Enforce cumulative daily quota
     _check_and_record_quota(api_key, span)
     
-    # 2. Proxy request upstream to private Hugging Face repo
-    upstream_url = _tile_url(filename)
-    upstream_headers = {"Authorization": f"Bearer {HF_TOKEN}", "Range": range_header}
+    # 2. Proxy request upstream to Hugging Face
+    upstream_headers = {"Authorization": f"Bearer {HF_TOKEN}", "Range": clamped_range}
     
     async with httpx.AsyncClient(timeout=30.0) as client:
         upstream_resp = await client.get(upstream_url, headers=upstream_headers, follow_redirects=True)
@@ -213,13 +247,3 @@ async def get_tile_bytes(filename: str, request: Request, x_api_key: Optional[st
             passthrough_headers[h] = upstream_resp.headers[h]
             
     return Response(content=body, status_code=upstream_resp.status_code, headers=passthrough_headers)
-
-def _parse_explicit_range_span(range_header: str) -> Optional[int]:
-    try:
-        unit, _, spec = range_header.partition("=")
-        if unit.strip().lower() != "bytes" or "," in spec:
-            return None
-        start_str, _, end_str = spec.partition("-")
-        return int(end_str) - int(start_str) + 1
-    except Exception:
-        return None
