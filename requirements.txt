@@ -1,0 +1,13 @@
+# ── Web framework ──────────────────────────────────────────────────────────
+fastapi>=0.110.0,<1.0.0
+uvicorn[standard]>=0.29.0,<1.0.0
+
+# ── Outbound proxy requests to the private HF URL ───────────────────────────
+httpx>=0.27.0,<1.0.0
+
+# ── Hugging Face Hub (builds the private, authenticated source URLs only) ──
+huggingface_hub>=0.22.0,<1.0.0
+
+# ── Used ONLY at startup to read tile headers for the footprint index ──────
+# (not used per-request — this gateway does no raster decoding at request time)
+rasterio>=1.3.0,<2.0.0

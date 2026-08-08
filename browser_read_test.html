@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<!--
+  Minimal browser example — proves the gateway works from client-side JS too,
+  using geotiff.js. This is deliberately NOT a polished map viewer: it just
+  reads one small window from one tile and logs the raw values, to confirm
+  the auth header + Range-request flow works end to end from a browser.
+
+  geotiff.js issues its own HTTP Range requests internally when you call
+  image.readRasters({window: [...]}) — you don't construct Range headers
+  yourself. The only thing you add beyond a normal geotiff.js call is the
+  `headers` option carrying your X-API-Key.
+-->
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>TRI Gateway — browser read test</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/geotiff/2.1.3/geotiff.min.js"></script>
+</head>
+<body>
+  <h3>TRI Gateway — browser read test</h3>
+  <pre id="out">Loading…</pre>
+
+  <script>
+    const GATEWAY_URL = "https://<your-service-name>.onrender.com";
+    const API_KEY     = "dev-key";              // must match CLIENT_API_KEY on the server
+    const TILE_FILE   = "TRI_Tile1_COG.tif";
+
+    async function main() {
+      const out = document.getElementById("out");
+      try {
+        const tiff = await GeoTIFF.fromUrl(`${GATEWAY_URL}/tiles/${TILE_FILE}`, {
+          headers: { "X-API-Key": API_KEY },
+        });
+        const image = await tiff.getImage();
+
+        // Read a small pixel window near the top-left corner — replace with
+        // real coordinates converted to pixel space for your actual use case.
+        const rasters = await image.readRasters({ window: [0, 0, 64, 64] });
+
+        out.textContent =
+          `Width: ${image.getWidth()}, Height: ${image.getHeight()}\n` +
+          `Sample window shape: ${rasters[0].length} values\n` +
+          `First few values: ${Array.from(rasters[0].slice(0, 10)).join(", ")}`;
+      } catch (err) {
+        out.textContent = "Error: " + err.message;
+        console.error(err);
+      }
+    }
+
+    main();
+  </script>
+</body>
+</html>
