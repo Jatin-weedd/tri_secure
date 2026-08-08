@@ -30,7 +30,7 @@ NODATA         = -9999.0
 WATERSHED_REPO = "J2003S/hydrology-data-vault"
 WATERSHED_FILE = "Watershed.fgb"
 
-MAX_RANGE_BYTES          = 8 * 1024 * 1024          # Max 8 MB per chunk
+MAX_RANGE_BYTES          = 8 * 1024 * 1024          # Max 8 MB per range chunk
 DAILY_BYTE_QUOTA_PER_KEY = 500 * 1024 * 1024        # Max 500 MB daily limit
 
 if not HF_TOKEN:
@@ -43,7 +43,7 @@ _ledger_lock: threading.Lock = threading.Lock()
 app = FastAPI(
     title="India TRI Data Gateway",
     description="Authenticated secure router and metered proxy for private raster layers.",
-    version="1.2.2",
+    version="1.2.3",
 )
 
 app.add_middleware(
@@ -213,38 +213,53 @@ async def get_tile_bytes(filename: str, request: Request, x_api_key: Optional[st
     # 1. Obtain pre-signed S3 CDN URL
     s3_cdn_url = await _resolve_s3_cdn_url(filename)
 
-    # 2. Handle HEAD requests (do NOT pass Authorization header to S3)
+    # 2. Handle HEAD requests
     if request.method == "HEAD":
         async with httpx.AsyncClient(timeout=30.0) as client:
             upstream_resp = await client.head(s3_cdn_url)
         headers = {"Accept-Ranges": "bytes"}
-        for h in ("Content-Length", "Content-Type"):
+        for h in ("Content-Length", "Content-Type", "Last-Modified", "ETag"):
             if h in upstream_resp.headers:
                 headers[h] = upstream_resp.headers[h]
         return Response(status_code=upstream_resp.status_code, headers=headers)
 
-    # 3. Handle GET range requests
+    # 3. Handle GET requests
     range_header = request.headers.get("range")
-    if not range_header:
-        range_header = f"bytes=0-{MAX_RANGE_BYTES - 1}"
-
-    clamped_range, span = _parse_and_clamp_range(range_header, MAX_RANGE_BYTES)
-    if not clamped_range or span is None:
-        raise HTTPException(status_code=400, detail="Invalid Range header format.")
     
-    _check_and_record_quota(api_key, span)
-    
-    # 4. Proxy range request directly to S3 without Authorization header
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        upstream_resp = await client.get(s3_cdn_url, headers={"Range": clamped_range})
+    if range_header:
+        # Client requested a SPECIFIC range -> Expects 206 Partial Content
+        clamped_range, span = _parse_and_clamp_range(range_header, MAX_RANGE_BYTES)
+        if not clamped_range or span is None:
+            raise HTTPException(status_code=400, detail="Invalid Range header format.")
         
-    if upstream_resp.status_code not in (200, 206):
-        raise HTTPException(status_code=502, detail="Error fetching byte range from upstream storage.")
-    
-    body = upstream_resp.content
-    passthrough_headers = {"Accept-Ranges": "bytes"}
-    for h in ("Content-Range", "Content-Length"):
-        if h in upstream_resp.headers:
-            passthrough_headers[h] = upstream_resp.headers[h]
+        _check_and_record_quota(api_key, span)
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            upstream_resp = await client.get(s3_cdn_url, headers={"Range": clamped_range})
             
-    return Response(content=body, status_code=upstream_resp.status_code, headers=passthrough_headers)
+        if upstream_resp.status_code not in (200, 206):
+            raise HTTPException(status_code=502, detail="Error fetching byte range from upstream storage.")
+        
+        passthrough_headers = {"Accept-Ranges": "bytes"}
+        for h in ("Content-Range", "Content-Length", "Content-Type", "ETag"):
+            if h in upstream_resp.headers:
+                passthrough_headers[h] = upstream_resp.headers[h]
+                
+        return Response(content=upstream_resp.content, status_code=upstream_resp.status_code, headers=passthrough_headers)
+    
+    else:
+        # Client did NOT send a Range header -> Expects 200 OK
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            upstream_resp = await client.get(s3_cdn_url)
+            
+        if upstream_resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="Error fetching tile from upstream storage.")
+        
+        _check_and_record_quota(api_key, len(upstream_resp.content))
+        
+        passthrough_headers = {"Accept-Ranges": "bytes"}
+        for h in ("Content-Length", "Content-Type", "ETag"):
+            if h in upstream_resp.headers:
+                passthrough_headers[h] = upstream_resp.headers[h]
+                
+        return Response(content=upstream_resp.content, status_code=200, headers=passthrough_headers)
