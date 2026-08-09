@@ -34,11 +34,11 @@ WATERSHED_FILE = "Watershed.fgb"
 MAX_RANGE_BYTES          = 8 * 1024 * 1024          
 DAILY_BYTE_QUOTA_PER_KEY  = 500 * 1024 * 1024        
 
-# ── Protection Rules ────────────────────────────────────────────────────────
-BURST_LIMIT  = 5        # Max 5 resolve requests per 1 minute
+# ── Protection Rules (Configured for ~25 Sites/Day) ─────────────────────────
+BURST_LIMIT  = 12       # Max 12 resolve requests per minute (allows ~2-3 sites/min)
 BURST_WINDOW = 60       # 60 seconds
 
-DAILY_QUOTA  = 20       # Max 20 resolve requests per 24 hours
+DAILY_QUOTA  = 100      # Max 100 resolve requests per 24 hours (allows ~25-30 sites/day)
 DAILY_WINDOW = 86400    # 24 hours (in seconds)
 
 TICKET_TTL_SECONDS = 60 # Gateway ticket self-destructs after 60 seconds
