@@ -30,20 +30,22 @@ NODATA         = -9999.0
 WATERSHED_REPO = "J2003S/hydrology-data-vault"
 WATERSHED_FILE = "Watershed.fgb"
 
-MAX_RANGE_BYTES          = 8 * 1024 * 1024          # Max 8 MB per range chunk
 DAILY_BYTE_QUOTA_PER_KEY = 500 * 1024 * 1024        # Max 500 MB daily limit
 
 if not HF_TOKEN:
     raise RuntimeError("HF_TOKEN environment variable is missing on Render.")
 
-# ── In-Memory Quota Ledger ───────────────────────────────────────────────────
+# ── In-Memory Quota Ledger & URL Cache ──────────────────────────────────────
 _usage_ledger: Dict[str, dict] = {}
-_ledger_lock: threading.Lock = threading.Lock()
+_ledger_lock = threading.Lock()
+
+_s3_url_cache: Dict[str, Tuple[str, float]] = {}
+_cache_lock = threading.Lock()
 
 app = FastAPI(
     title="India TRI Data Gateway",
     description="Authenticated secure router and metered proxy for private raster layers.",
-    version="1.2.3",
+    version="1.2.4",
 )
 
 app.add_middleware(
@@ -66,7 +68,7 @@ GDAL_OPTS = {
     "CPL_VSIL_CURL_USE_HEAD": "NO",
     "VSI_CACHE": "TRUE",
     "VSI_CACHE_SIZE": "16000000",
-    "GDAL_HTTP_MULTIRANGE": "YES",
+    "GDAL_HTTP_MULTIRANGE": "NO",
 }
 
 @contextmanager
@@ -78,7 +80,7 @@ def open_tile_as_4326(filename: str):
                 yield vrt
 
 # ── Tile Footprint Indexing ──────────────────────────────────────────────────
-_index_lock: threading.Lock = threading.Lock()
+_index_lock = threading.Lock()
 _tile_bounds: Dict[str, Tuple[float, float, float, float]] = {}
 _index_ready: bool = False
 
@@ -125,31 +127,15 @@ def _check_and_record_quota(api_key: str, requested_bytes: int):
 
         record["bytes"] += requested_bytes
 
-def _parse_and_clamp_range(range_header: str, max_bytes: int) -> Tuple[Optional[str], Optional[int]]:
-    try:
-        unit, _, spec = range_header.partition("=")
-        if unit.strip().lower() != "bytes" or "," in spec:
-            return None, None
-        
-        start_str, _, end_str = spec.partition("-")
-        start = int(start_str.strip())
-        
-        if end_str.strip():
-            end = int(end_str.strip())
-            span = end - start + 1
-            if span > max_bytes:
-                end = start + max_bytes - 1
-                span = max_bytes
-        else:
-            end = start + max_bytes - 1
-            span = max_bytes
-            
-        return f"bytes={start}-{end}", span
-    except Exception:
-        return None, None
+async def _get_cached_s3_cdn_url(filename: str) -> str:
+    """Retrieves or caches the pre-signed S3 CDN URL for 10 minutes."""
+    now = time.time()
+    with _cache_lock:
+        if filename in _s3_url_cache:
+            url, expires_at = _s3_url_cache[filename]
+            if now < expires_at:
+                return url
 
-async def _resolve_s3_cdn_url(filename: str) -> str:
-    """Resolves HF 302 redirect to obtain the raw pre-signed S3 CDN URL."""
     raw_url = _tile_url(filename)
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.head(
@@ -157,9 +143,12 @@ async def _resolve_s3_cdn_url(filename: str) -> str:
             headers={"Authorization": f"Bearer {HF_TOKEN}"},
             follow_redirects=False
         )
-        if resp.status_code in (301, 302, 303, 307) and "location" in resp.headers:
-            return resp.headers["location"]
-        return raw_url
+        s3_url = resp.headers["location"] if resp.status_code in (301, 302, 303, 307) and "location" in resp.headers else raw_url
+
+    with _cache_lock:
+        _s3_url_cache[filename] = (s3_url, now + 600)  # Cache for 10 minutes
+
+    return s3_url
 
 def _resolve_signed_url(repo_id: str, filename: str, repo_type: str = "dataset") -> str:
     raw_url = hf_hub_url(repo_id=repo_id, filename=filename, repo_type=repo_type)
@@ -210,56 +199,54 @@ async def get_tile_bytes(filename: str, request: Request, x_api_key: Optional[st
     if filename not in TRI_TILES:
         raise HTTPException(status_code=404, detail="Unknown tile filename.")
 
-    # 1. Obtain pre-signed S3 CDN URL
-    s3_cdn_url = await _resolve_s3_cdn_url(filename)
+    s3_cdn_url = await _get_cached_s3_cdn_url(filename)
 
-    # 2. Handle HEAD requests
+    upstream_headers = {
+        "User-Agent": "FastAPI-Raster-Proxy",
+        "Accept-Encoding": "identity",
+    }
+    
+    range_header = request.headers.get("range")
+    if range_header:
+        upstream_headers["Range"] = range_header
+
+    # Handle HEAD
     if request.method == "HEAD":
         async with httpx.AsyncClient(timeout=30.0) as client:
-            upstream_resp = await client.head(s3_cdn_url)
+            upstream_resp = await client.head(s3_cdn_url, headers=upstream_headers)
         headers = {"Accept-Ranges": "bytes"}
         for h in ("Content-Length", "Content-Type", "Last-Modified", "ETag"):
             if h in upstream_resp.headers:
                 headers[h] = upstream_resp.headers[h]
         return Response(status_code=upstream_resp.status_code, headers=headers)
 
-    # 3. Handle GET requests
-    range_header = request.headers.get("range")
-    
-    if range_header:
-        # Client requested a SPECIFIC range -> Expects 206 Partial Content
-        clamped_range, span = _parse_and_clamp_range(range_header, MAX_RANGE_BYTES)
-        if not clamped_range or span is None:
-            raise HTTPException(status_code=400, detail="Invalid Range header format.")
-        
-        _check_and_record_quota(api_key, span)
-        
+    # Handle GET
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        upstream_resp = await client.get(s3_cdn_url, headers=upstream_headers)
+
+    # Retry once on expired S3 URL
+    if upstream_resp.status_code in (400, 403):
+        with _cache_lock:
+            _s3_url_cache.pop(filename, None)
+        s3_cdn_url = await _get_cached_s3_cdn_url(filename)
         async with httpx.AsyncClient(timeout=30.0) as client:
-            upstream_resp = await client.get(s3_cdn_url, headers={"Range": clamped_range})
-            
-        if upstream_resp.status_code not in (200, 206):
-            raise HTTPException(status_code=502, detail="Error fetching byte range from upstream storage.")
-        
-        passthrough_headers = {"Accept-Ranges": "bytes"}
-        for h in ("Content-Range", "Content-Length", "Content-Type", "ETag"):
-            if h in upstream_resp.headers:
-                passthrough_headers[h] = upstream_resp.headers[h]
-                
-        return Response(content=upstream_resp.content, status_code=upstream_resp.status_code, headers=passthrough_headers)
-    
-    else:
-        # Client did NOT send a Range header -> Expects 200 OK
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            upstream_resp = await client.get(s3_cdn_url)
-            
-        if upstream_resp.status_code != 200:
-            raise HTTPException(status_code=502, detail="Error fetching tile from upstream storage.")
-        
-        _check_and_record_quota(api_key, len(upstream_resp.content))
-        
-        passthrough_headers = {"Accept-Ranges": "bytes"}
-        for h in ("Content-Length", "Content-Type", "ETag"):
-            if h in upstream_resp.headers:
-                passthrough_headers[h] = upstream_resp.headers[h]
-                
-        return Response(content=upstream_resp.content, status_code=200, headers=passthrough_headers)
+            upstream_resp = await client.get(s3_cdn_url, headers=upstream_headers)
+
+    if upstream_resp.status_code not in (200, 206):
+        raise HTTPException(
+            status_code=upstream_resp.status_code,
+            detail=f"Upstream storage error ({upstream_resp.status_code}): {upstream_resp.text[:200]}"
+        )
+
+    _check_and_record_quota(api_key, len(upstream_resp.content))
+
+    passthrough_headers = {"Accept-Ranges": "bytes"}
+    for h in ("Content-Range", "Content-Length", "Content-Type", "ETag"):
+        if h in upstream_resp.headers:
+            passthrough_headers[h] = upstream_resp.headers[h]
+
+    return Response(
+        content=upstream_resp.content,
+        status_code=upstream_resp.status_code,
+        headers=passthrough_headers
+    )
